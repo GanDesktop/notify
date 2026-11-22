@@ -157,6 +157,7 @@ impl EventLoop {
                     ident: Ident::Filename(_, path),
                 } => {
                     let path = PathBuf::from(path);
+                    let is_recursive = self.watches.get(&path).copied().unwrap_or(false);
                     let event = match data {
                         /*
                         TODO: Differentiate folders and files
@@ -170,9 +171,12 @@ impl EventLoop {
                             Ok(Event::new(EventKind::Remove(RemoveKind::Any)).add_path(path))
                         }
 
-                        // a write to a directory means that a new file was created in it, let's
-                        // figure out which file this was
-                        kqueue::Vnode::Write if path.is_dir() => {
+                        // A write to a recursively watched directory may mean that a new file
+                        // was created in it. Non-recursive directory watches do not track
+                        // children, so guessing from read_dir would misreport pre-existing
+                        // entries (https://github.com/notify-rs/notify/issues/644); report
+                        // the directory's own modification instead.
+                        kqueue::Vnode::Write if is_recursive && path.is_dir() => {
                             // find which file is new in the directory by comparing it with our
                             // list of known watches
                             std::fs::read_dir(&path)
@@ -237,22 +241,10 @@ impl EventLoop {
                         delete.
                         */
                         kqueue::Vnode::Link => {
-                            // As we currently don't have a solution that would allow us
-                            // to only add/remove the new/delete directory and that dosn't include a
-                            // possible race condition. On possible solution would be to
-                            // create a `HashMap<PathBuf, Vec<PathBuf>>` which would
-                            // include every directory and this content add the time of
-                            // adding it to kqueue. While this should allow us to do the
-                            // diff and only add/remove the files necessary. This would
-                            // also introduce a race condition, where multiple files could
-                            // all ready be remove from the directory, and we could get out
-                            // of sync.
-                            // So for now, until we find a better solution, let remove and
-                            // readd the whole directory.
-                            // This is a expensive operation, as we recursive through all
-                            // subdirectories.
-                            remove_watches.push(path.clone());
-                            add_watches.push(path.clone());
+                            if is_recursive {
+                                remove_watches.push(path.clone());
+                                add_watches.push(path.clone());
+                            }
                             Ok(Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path))
                         }
 
@@ -476,6 +468,38 @@ mod tests {
             "unwatch yielded error: {}",
             result.unwrap_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_nonrecursive_dir_write_reports_dir_not_existing_child() -> Result<(), Box<dyn Error>> {
+        use crate::event::EventKind;
+        use std::fs;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir()?;
+        let existing = dir.path().join("original.txt");
+        fs::write(&existing, "before watch")?;
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = KqueueWatcher::new(
+            move |res| {
+                let _ = tx.send(res);
+            },
+            Config::default(),
+        )?;
+        watcher.watch(dir.path(), RecursiveMode::NonRecursive)?;
+
+        let created = dir.path().join("created.txt");
+        fs::write(&created, "after watch")?;
+
+        let event = rx.recv_timeout(Duration::from_secs(5))??;
+        assert!(
+            matches!(event.kind, EventKind::Modify(_)),
+            "expected directory Modify event, got: {event:?}"
+        );
+        assert_eq!(event.paths, vec![dir.path().to_path_buf()]);
         Ok(())
     }
 }
